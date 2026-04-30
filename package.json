@@ -1,0 +1,29 @@
+{
+  "name": "insighta-labs-backend",
+  "version": "3.0.0",
+  "description": "Insighta Labs+ Backend — Stage 3",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-sqlite src/index.js",
+    "dev": "nodemon --experimental-sqlite src/index.js",
+    "lint": "echo 'no linter configured'",
+    "test": "echo 'tests: see README'"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.5",
+    "jsonwebtoken": "^9.0.2",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "axios": "^1.6.5",
+    "csv-stringify": "^6.4.5",
+    "uuid": "^11.0.0",
+    "morgan": "^1.10.0",
+    "helmet": "^7.1.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  }
+}

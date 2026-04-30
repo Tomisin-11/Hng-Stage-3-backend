@@ -1,0 +1,42 @@
+name: Backend CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (ESLint)
+        run: npm run lint --if-present
+
+      - name: Run tests
+        run: npm test --if-present
+        env:
+          NODE_ENV: test
+          ACCESS_TOKEN_SECRET: test-access-secret-do-not-use-in-production
+          REFRESH_TOKEN_SECRET: test-refresh-secret-do-not-use-in-production
+          ACCESS_TOKEN_EXPIRY: 180
+          REFRESH_TOKEN_EXPIRY: 300
+          PORT: 4000
+          DB_PATH: ':memory:'
+
+      - name: Build check
+        run: node --check src/index.js
