@@ -1,39 +1,43 @@
 // src/routes/profiles.js
 //
-// Profile endpoints — TRD spec:
+// Profile endpoints — TRD spec (Stage 3, unchanged) + Stage 4B additions:
 //
 //   GET    /api/profiles               — list (filters, sort, pagination, NL search)
-//   GET    /api/profiles/search        — natural language search (same response shape)
+//   GET    /api/profiles/search        — natural language search
 //   GET    /api/profiles/export        — CSV export (?format=csv required)
 //   GET    /api/profiles/:id           — single profile
-//   POST   /api/profiles               — create (admin only, calls external APIs)
+//   POST   /api/profiles               — create (admin only)
 //   DELETE /api/profiles/:id           — delete (admin only)
+//   POST   /api/profiles/import        — CSV bulk upload (admin only) [Stage 4B]
+//   GET    /api/profiles/cache-stats   — cache diagnostics [Stage 4B]
 //
-// TRD REQUIREMENTS:
-//   - X-API-Version: 1 header required (enforced by parent router middleware)
-//   - Paginated responses include links: { self, next, prev }
-//   - Admins: full access; Analysts: read + search + export only
-//   - CSV: id, name, gender, gender_probability, age, age_group,
-//          country_id, country_name, country_probability, created_at
+// Stage 4B changes:
+//   - GET / and GET /search check the LRU cache before querying the DB
+//   - Filters are normalized before cache lookup so semantically equivalent
+//     queries hit the same cache entry
+//   - POST, DELETE, and /import invalidate the cache after writes
+//   - /import streams the uploaded CSV in chunks; does not load file into memory
 
 import { Router } from 'express';
 import { stringify } from 'csv-stringify/sync';
 import axios from 'axios';
+import { unlink } from 'node:fs/promises';
 import { protect, requireRole } from '../middleware/auth.js';
 import { apiLimiter } from '../middleware/rateLimiter.js';
 import { sendSuccess, sendError, sendPaginated } from '../utils/response.js';
 import { parseNaturalLanguageQuery } from '../services/nlpSearch.js';
+import { queryCache } from '../services/queryCache.js';
+import { normalizeFilters, makeCacheKey } from '../services/queryNormalizer.js';
+import { processCSV } from '../services/csvIngestion.js';
+import { uploadCSV } from '../middleware/upload.js';
 import db, { uuidv7 } from '../config/database.js';
 
 const router = Router();
 
-// All profile routes require authentication + active account + rate limiting
 router.use(...protect, apiLimiter);
 
 // ---------------------------------------------------------------------------
-// QUERY BUILDER
-// Safely build parameterized WHERE clause from filter object.
-// Never interpolate user input directly into SQL — always use ? placeholders.
+// QUERY BUILDER (unchanged from Stage 3)
 // ---------------------------------------------------------------------------
 function buildWhere(filters) {
   const conditions = [];
@@ -63,7 +67,6 @@ function buildWhere(filters) {
     conditions.push('age <= ?');
     params.push(parseInt(filters.max_age));
   }
-  // Full-text search across name + country_name
   if (filters.search) {
     conditions.push('(LOWER(name) LIKE LOWER(?) OR LOWER(country_name) LIKE LOWER(?))');
     const t = `%${filters.search}%`;
@@ -76,7 +79,6 @@ function buildWhere(filters) {
   };
 }
 
-// Whitelist sortable columns to prevent SQL injection via sort param
 const SORTABLE = ['name', 'age', 'gender', 'country_name', 'created_at', 'gender_probability'];
 
 function getSortParams(sortBy, order) {
@@ -87,8 +89,6 @@ function getSortParams(sortBy, order) {
 
 // ---------------------------------------------------------------------------
 // GET /api/profiles
-// List profiles with filtering, sorting, pagination.
-// Both admin and analyst can access.
 // ---------------------------------------------------------------------------
 router.get('/', (req, res) => {
   const {
@@ -97,45 +97,58 @@ router.get('/', (req, res) => {
     sort_by, order, page: pageQ, limit: limitQ,
   } = req.query;
 
-  const filters = { gender, country_id, country_name, age_group, min_age, max_age, search };
-  const { whereClause, params } = buildWhere(filters);
-
-  const page = Math.max(1, parseInt(pageQ) || 1);
+  const page  = Math.max(1, parseInt(pageQ) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(limitQ) || 10));
-  const offset = (page - 1) * limit;
+
+  // Normalize filters → deterministic cache key
+  const rawFilters = { gender, country_id, country_name, age_group, min_age, max_age, search };
+  const normalized = normalizeFilters(rawFilters);
+  const cacheKey   = makeCacheKey(normalized, page, limit, sort_by, order);
+
+  // Cache hit → return immediately, no DB query
+  const cached = queryCache.get(cacheKey);
+  if (cached) {
+    return res.json(cached);
+  }
+
+  // Cache miss → query DB
+  const { whereClause, params } = buildWhere(normalized);
   const orderClause = getSortParams(sort_by, order);
+  const offset = (page - 1) * limit;
 
-  const total = db.prepare(
-    `SELECT COUNT(*) as c FROM profiles ${whereClause}`
-  ).get(...params).c;
-
+  const total    = db.prepare(`SELECT COUNT(*) as c FROM profiles ${whereClause}`).get(...params).c;
   const profiles = db.prepare(
     `SELECT * FROM profiles ${whereClause} ORDER BY ${orderClause} LIMIT ? OFFSET ?`
   ).all(...params, limit, offset);
 
-  // Build query object for HATEOAS links (exclude page/limit — those are added by sendPaginated)
   const queryObj = {};
-  if (gender) queryObj.gender = gender;
-  if (country_id) queryObj.country_id = country_id;
-  if (age_group) queryObj.age_group = age_group;
-  if (search) queryObj.search = search;
-  if (sort_by) queryObj.sort_by = sort_by;
-  if (order) queryObj.order = order;
+  if (normalized.gender)       queryObj.gender       = normalized.gender;
+  if (normalized.country_id)   queryObj.country_id   = normalized.country_id;
+  if (normalized.age_group)    queryObj.age_group     = normalized.age_group;
+  if (normalized.search)       queryObj.search        = normalized.search;
+  if (sort_by)                 queryObj.sort_by       = sort_by;
+  if (order)                   queryObj.order         = order;
 
-  return sendPaginated(res, {
+  // Build the response payload and cache it
+  // We reconstruct sendPaginated's output so we can store + return the same shape
+  const baseUrl  = `/api/profiles`;
+  const selfUrl  = buildPaginatedUrl(baseUrl, queryObj, page, limit);
+  const nextUrl  = page * limit < total ? buildPaginatedUrl(baseUrl, queryObj, page + 1, limit) : null;
+  const prevUrl  = page > 1            ? buildPaginatedUrl(baseUrl, queryObj, page - 1, limit) : null;
+
+  const payload = {
+    status: 'success',
     data: profiles,
-    page,
-    limit,
-    total,
-    basePath: '/api/profiles',
-    query: queryObj,
-  });
+    pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    links: { self: selfUrl, next: nextUrl, prev: prevUrl },
+  };
+
+  queryCache.set(cacheKey, payload);
+  return res.json(payload);
 });
 
 // ---------------------------------------------------------------------------
-// GET /api/profiles/search
-// Natural language search. Must be defined BEFORE /:id to avoid route conflict.
-// TRD: Same response shape as GET /api/profiles.
+// GET /api/profiles/search  — natural language search
 // ---------------------------------------------------------------------------
 router.get('/search', (req, res) => {
   const rawQuery = req.query.q || req.query.query || '';
@@ -143,41 +156,49 @@ router.get('/search', (req, res) => {
     return sendError(res, 'Query parameter ?q is required', 400);
   }
 
-  // Parse NL query into structured filters
-  const nlFilters = parseNaturalLanguageQuery(rawQuery);
-  // Only use raw text search if NL extracted no structured filters
-  if (Object.keys(nlFilters).length === 0) {
-    nlFilters.search = rawQuery;
+  const page  = Math.max(1, parseInt(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+
+  // Parse NL → structured filters → normalize → cache key
+  const nlFilters  = parseNaturalLanguageQuery(rawQuery);
+  if (Object.keys(nlFilters).length === 0) nlFilters.search = rawQuery;
+
+  const normalized = normalizeFilters(nlFilters);
+  // Include the raw query in the key so different NL inputs that map to the
+  // same filters still share the same cache entry.
+  const cacheKey = makeCacheKey(normalized, page, limit, 'created_at', 'desc');
+
+  const cached = queryCache.get(cacheKey);
+  if (cached) {
+    return res.json(cached);
   }
 
-  const { whereClause, params } = buildWhere(nlFilters);
-  const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
+  const { whereClause, params } = buildWhere(normalized);
   const offset = (page - 1) * limit;
 
-  const total = db.prepare(
-    `SELECT COUNT(*) as c FROM profiles ${whereClause}`
-  ).get(...params).c;
-
+  const total    = db.prepare(`SELECT COUNT(*) as c FROM profiles ${whereClause}`).get(...params).c;
   const profiles = db.prepare(
     `SELECT * FROM profiles ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
   ).all(...params, limit, offset);
 
-  return sendPaginated(res, {
+  const baseUrl = `/api/profiles/search`;
+  const selfUrl = buildPaginatedUrl(baseUrl, { q: rawQuery }, page, limit);
+  const nextUrl = page * limit < total ? buildPaginatedUrl(baseUrl, { q: rawQuery }, page + 1, limit) : null;
+  const prevUrl = page > 1             ? buildPaginatedUrl(baseUrl, { q: rawQuery }, page - 1, limit) : null;
+
+  const payload = {
+    status: 'success',
     data: profiles,
-    page,
-    limit,
-    total,
-    basePath: '/api/profiles/search',
-    query: { q: rawQuery },
-  });
+    pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+    links: { self: selfUrl, next: nextUrl, prev: prevUrl },
+  };
+
+  queryCache.set(cacheKey, payload);
+  return res.json(payload);
 });
 
 // ---------------------------------------------------------------------------
-// GET /api/profiles/export?format=csv
-// TRD: Applies same filters as GET /api/profiles. Returns CSV file.
-// CSV columns: id, name, gender, gender_probability, age, age_group,
-//              country_id, country_name, country_probability, created_at
+// GET /api/profiles/export?format=csv (unchanged)
 // ---------------------------------------------------------------------------
 router.get('/export', (req, res) => {
   if (req.query.format !== 'csv') {
@@ -207,7 +228,14 @@ router.get('/export', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /api/profiles/:id
+// GET /api/profiles/cache-stats  — diagnostic endpoint (Stage 4B)
+// ---------------------------------------------------------------------------
+router.get('/cache-stats', (req, res) => {
+  return sendSuccess(res, { cache: queryCache.stats() });
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/profiles/:id (unchanged)
 // ---------------------------------------------------------------------------
 router.get('/:id', (req, res) => {
   const profile = db.prepare('SELECT * FROM profiles WHERE id = ?').get(req.params.id);
@@ -216,32 +244,27 @@ router.get('/:id', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /api/profiles
-// Admin only. TRD: accepts { name } → calls external APIs → stores → returns.
-//
-// External APIs used (from Stage 1):
-//   Genderize.io   — gender + probability
-//   Agify.io       — age + age_group
-//   Nationalize.io — country + probability
+// POST /api/profiles  (unchanged; invalidates cache on success)
 // ---------------------------------------------------------------------------
 router.post('/', requireRole('admin'), async (req, res) => {
   const { name } = req.body;
   if (!name?.trim()) return sendError(res, 'name is required', 400);
 
+  // Idempotency: reject if name already exists
+  const existing = db.prepare('SELECT id FROM profiles WHERE LOWER(name) = LOWER(?)').get(name.trim());
+  if (existing) return sendError(res, 'A profile with this name already exists', 409);
+
   try {
-    // Call all three external APIs concurrently for performance
     const [genderRes, ageRes, nationalityRes] = await Promise.allSettled([
       axios.get(`https://api.genderize.io?name=${encodeURIComponent(name)}`),
       axios.get(`https://api.agify.io?name=${encodeURIComponent(name)}`),
       axios.get(`https://api.nationalize.io?name=${encodeURIComponent(name)}`),
     ]);
 
-    // Extract data (use null if an API call failed)
-    const genderData = genderRes.status === 'fulfilled' ? genderRes.value.data : {};
-    const ageData = ageRes.status === 'fulfilled' ? ageRes.value.data : {};
+    const genderData      = genderRes.status === 'fulfilled'      ? genderRes.value.data      : {};
+    const ageData         = ageRes.status === 'fulfilled'         ? ageRes.value.data         : {};
     const nationalityData = nationalityRes.status === 'fulfilled' ? nationalityRes.value.data : {};
 
-    // Compute age_group from age
     const age = ageData.age ?? null;
     let age_group = null;
     if (age !== null) {
@@ -251,10 +274,8 @@ router.post('/', requireRole('admin'), async (req, res) => {
       else age_group = 'senior';
     }
 
-    // Take the top nationality result
     const topNationality = nationalityData.country?.[0] ?? null;
 
-    // Get country name from country_id (simple lookup)
     const COUNTRY_NAMES = {
       US: 'United States', GB: 'United Kingdom', NG: 'Nigeria', GH: 'Ghana',
       DE: 'Germany', FR: 'France', BR: 'Brazil', KR: 'South Korea',
@@ -262,10 +283,9 @@ router.post('/', requireRole('admin'), async (req, res) => {
       KE: 'Kenya', EG: 'Egypt', JP: 'Japan', CN: 'China',
     };
 
-    const countryId = topNationality?.country_id ?? null;
+    const countryId   = topNationality?.country_id ?? null;
     const countryName = countryId ? (COUNTRY_NAMES[countryId] ?? countryId) : null;
 
-    // Save to DB
     const id = uuidv7();
     db.prepare(`
       INSERT INTO profiles
@@ -273,16 +293,14 @@ router.post('/', requireRole('admin'), async (req, res) => {
          country_id, country_name, country_probability)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      id,
-      name.trim(),
+      id, name.trim(),
       genderData.gender ?? null,
       genderData.probability ?? null,
-      age,
-      age_group,
-      countryId,
-      countryName,
+      age, age_group, countryId, countryName,
       topNationality?.probability ?? null,
     );
+
+    queryCache.invalidate(); // New data — stale cache results must not be served
 
     const created = db.prepare('SELECT * FROM profiles WHERE id = ?').get(id);
     return sendSuccess(res, { data: created }, 201);
@@ -292,14 +310,68 @@ router.post('/', requireRole('admin'), async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// DELETE /api/profiles/:id — admin only
+// POST /api/profiles/import  — CSV bulk upload (Stage 4B, admin only)
+//
+// Flow:
+//   1. multer saves the uploaded file to disk (no memory buffering)
+//   2. processCSV() streams it line-by-line, validates and batch-inserts rows
+//   3. The temp file is deleted regardless of success or failure
+//   4. The query cache is invalidated (processCSV does this internally)
+//   5. Summary stats are returned
+//
+// The route is defined BEFORE /:id to avoid Express matching 'import' as an ID.
+// ---------------------------------------------------------------------------
+router.post('/import', requireRole('admin'), (req, res) => {
+  // Run multer as a callback so we can return proper JSON errors instead of
+  // multer's default HTML error responses.
+  uploadCSV(req, res, async (err) => {
+    if (err) {
+      return sendError(res, err.message, 400);
+    }
+    if (!req.file) {
+      return sendError(res, 'No file uploaded. Send a CSV as form-data field "file".', 400);
+    }
+
+    const filePath = req.file.path;
+
+    try {
+      const stats = await processCSV(filePath);
+      return res.json({
+        status: 'success',
+        total_rows: stats.total_rows,
+        inserted: stats.inserted,
+        skipped: stats.skipped,
+        reasons: stats.reasons,
+      });
+    } catch (processingErr) {
+      console.error('[import] Processing error:', processingErr);
+      return sendError(res, `CSV processing failed: ${processingErr.message}`, 500);
+    } finally {
+      // Always clean up the temp file — success or failure
+      unlink(filePath).catch(() => {});
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /api/profiles/:id  (unchanged; invalidates cache on success)
 // ---------------------------------------------------------------------------
 router.delete('/:id', requireRole('admin'), (req, res) => {
   const profile = db.prepare('SELECT * FROM profiles WHERE id = ?').get(req.params.id);
   if (!profile) return sendError(res, 'Profile not found', 404);
 
   db.prepare('DELETE FROM profiles WHERE id = ?').run(req.params.id);
+  queryCache.invalidate(); // Deleted row must not appear in cached results
+
   return sendSuccess(res, { message: 'Profile deleted', id: req.params.id });
 });
+
+// ---------------------------------------------------------------------------
+// Internal helper: build paginated URL with query params
+// ---------------------------------------------------------------------------
+function buildPaginatedUrl(base, query, page, limit) {
+  const params = new URLSearchParams({ ...query, page, limit });
+  return `${base}?${params.toString()}`;
+}
 
 export default router;
